@@ -75,7 +75,9 @@ async def process_message(msg):
             messages=[{"role": "user", "content": text}]
         )
         data = json.loads(response.content[0].text.strip())
-    except:
+        print(f"Claude OK: {data}", flush=True)
+    except Exception as e:
+        print(f"Claude error: {e}", flush=True)
         return
 
     loai = data.get("loai", "KHÔNG RÕ")
