@@ -2,7 +2,7 @@ import os, asyncio, json, httpx
 from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import anthropic
-
+print("BOT KHOI DONG", flush=True)
 TOKEN = os.environ["BOT_TOKEN"]
 GROUP_ID = int(os.environ["GROUP_ID"])
 ANTHROPIC_KEY = os.environ["ANTHROPIC_KEY"]
