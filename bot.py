@@ -140,6 +140,7 @@ async def send_daily_report():
 
 async def polling():
     offset = 0
+    print("Bot started, polling...")
     async with httpx.AsyncClient(timeout=35) as http:
         while True:
             try:
@@ -148,9 +149,11 @@ async def polling():
                 for u in updates:
                     offset = u["update_id"] + 1
                     msg = u.get("message")
+                    print(f"Received update: {u}")
                     if msg and msg.get("text"):
                         asyncio.create_task(process_message(msg))
-            except:
+            except Exception as e:
+                print(f"Polling error: {e}")
                 await asyncio.sleep(5)
 
 async def main():
