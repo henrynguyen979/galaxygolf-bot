@@ -1,7 +1,6 @@
-import os, asyncio, json
+import os, asyncio, json, httpx
 from datetime import datetime
-from telegram import Update, Bot
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import anthropic
 
 TOKEN = os.environ["BOT_TOKEN"]
@@ -10,70 +9,64 @@ ANTHROPIC_KEY = os.environ["ANTHROPIC_KEY"]
 
 entries = []
 client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+BASE = f"https://api.telegram.org/bot{TOKEN}"
 
 CLASSIFY_PROMPT = """Bạn là trợ lý nhật ký bán hàng Galaxy Golf Nha Trang.
-
-Nhiệm vụ: Phân tích tin nhắn tự do từ nhân viên và xác định đây là giao dịch gì.
-
-Quy tắc phân loại:
-- BÁN: có thông tin bán hàng cho khách (tên khách, sản phẩm, giá)
-- NHẬP: hàng về kho, nhập từ nhà cung cấp
-- THU CHI: thu tiền hoặc chi tiền vận hành
-- KHÔNG RÕ: tin nhắn không liên quan đến giao dịch
-
-Trả về JSON theo format sau, KHÔNG có markdown:
+Phân tích tin nhắn tự do và xác định loại giao dịch.
+Trả về JSON, KHÔNG có markdown:
 {
   "loai": "BÁN" hoặc "NHẬP" hoặc "THU CHI" hoặc "KHÔNG RÕ",
   "du_lieu": {
-    "kh": "tên khách (nếu có)",
-    "sdt": "số điện thoại (nếu có)",
-    "dia_chi": "địa chỉ giao hàng (nếu có)",
+    "kh": "tên khách",
+    "sdt": "số điện thoại",
+    "dia_chi": "địa chỉ giao hàng",
     "sp": "tên sản phẩm",
-    "gia": "số tiền (chỉ số nguyên)",
-    "tt": "hình thức thanh toán: TM/CK/COD/Ký gửi",
-    "ncc": "nhà cung cấp (nếu là NHẬP)",
-    "gc": "ghi chú thêm"
+    "gia": "số tiền nguyên",
+    "tt": "TM/CK/COD/Ký gửi",
+    "ncc": "nhà cung cấp nếu NHẬP",
+    "gc": "ghi chú"
   },
-  "thieu": ["danh sách trường còn thiếu quan trọng"],
-  "xac_nhan": "tin nhắn xác nhận ngắn gọn cho nhân viên"
+  "thieu": ["trường còn thiếu quan trọng"]
 }"""
 
-REPORT_PROMPT = """Bạn là trợ lý tổng hợp nhật ký bán hàng Galaxy Golf Nha Trang.
-Từ danh sách giao dịch trong ngày, tạo báo cáo cuối ngày theo format:
-
+REPORT_PROMPT = """Tạo báo cáo cuối ngày Galaxy Golf Nha Trang từ dữ liệu giao dịch.
+Format:
 📅 NHẬT KÝ BÁN HÀNG — [NGÀY]
 🏪 Galaxy Golf Nha Trang
 
-🛒 BÁN HÀNG: [số đơn] đơn
-[liệt kê từng đơn]
-→ Tổng doanh thu: [số tiền]
+🛒 BÁN HÀNG: X đơn
+[chi tiết]
+→ Tổng: X đ
 
-📦 NHẬP HÀNG: [số lô] lô  
-[liệt kê]
-→ Tổng tiền nhập: [số tiền]
+📦 NHẬP HÀNG: X lô
+[chi tiết]
+→ Tổng: X đ
 
 💰 THU CHI KHÁC:
-[liệt kê]
+[chi tiết]
 
 📊 TỔNG KẾT:
-Doanh thu bán: [số]
-Tiền nhập hàng: [số]
-Thu khác: [số]
-Chi khác: [số]
-LỢI NHUẬN GỘP: [số]"""
+Doanh thu: X đ
+Tiền nhập: X đ
+Thu khác: X đ
+Chi khác: X đ
+LỢI NHUẬN GỘP: X đ"""
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if not msg or not msg.text:
-        return
+async def send_message(chat_id, text, reply_to=None):
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    if reply_to:
+        payload["reply_to_message_id"] = reply_to
+    async with httpx.AsyncClient() as http:
+        await http.post(f"{BASE}/sendMessage", json=payload)
 
-    text = msg.text.strip()
-
-    # Bỏ qua tin nhắn quá ngắn hoặc không liên quan
+async def process_message(msg):
+    text = msg.get("text", "").strip()
     if len(text) < 5:
         return
+    user = msg.get("from", {}).get("first_name", "NV")
+    msg_id = msg.get("message_id")
+    chat_id = msg.get("chat", {}).get("id")
 
-    # Gọi Claude phân tích tin nhắn tự do
     try:
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -81,9 +74,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             system=CLASSIFY_PROMPT,
             messages=[{"role": "user", "content": text}]
         )
-        raw = response.content[0].text.strip()
-        data = json.loads(raw)
-    except Exception as e:
+        data = json.loads(response.content[0].text.strip())
+    except:
         return
 
     loai = data.get("loai", "KHÔNG RÕ")
@@ -92,56 +84,45 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     du_lieu = data.get("du_lieu", {})
     thieu = data.get("thieu", [])
-    xac_nhan = data.get("xac_nhan", "")
 
-    # Lưu giao dịch
     entries.append({
         "time": datetime.now().strftime("%H:%M"),
-        "user": msg.from_user.first_name,
+        "user": user,
         "loai": loai,
         "du_lieu": du_lieu,
         "raw": text
     })
 
-    # Tạo tin xác nhận
     gia = du_lieu.get("gia", "")
-    gia_fmt = f"{int(gia):,}đ".replace(",", ".") if str(gia).isdigit() else gia
+    try:
+        gia_fmt = f"{int(gia):,}đ".replace(",", ".")
+    except:
+        gia_fmt = gia
 
     if loai == "BÁN":
-        icon = "✅"
-        tom_tat = f"Ghi nhận bán *{du_lieu.get('sp','')}*"
-        if du_lieu.get('kh'): tom_tat += f" cho {du_lieu.get('kh')}"
-        if gia_fmt: tom_tat += f" — {gia_fmt}"
-        if du_lieu.get('tt'): tom_tat += f" ({du_lieu.get('tt')})"
-        if du_lieu.get('dia_chi'): tom_tat += f"\n📍 Giao: {du_lieu.get('dia_chi')}"
+        reply = f"✅ Ghi nhận bán *{du_lieu.get('sp','')}*"
+        if du_lieu.get('kh'): reply += f" cho {du_lieu.get('kh')}"
+        if gia_fmt: reply += f" — {gia_fmt}"
+        if du_lieu.get('tt'): reply += f" ({du_lieu.get('tt')})"
+        if du_lieu.get('dia_chi'): reply += f"\n📍 {du_lieu.get('dia_chi')}"
     elif loai == "NHẬP":
-        icon = "📦"
-        tom_tat = f"Ghi nhận nhập *{du_lieu.get('sp','')}*"
-        if du_lieu.get('ncc'): tom_tat += f" từ {du_lieu.get('ncc')}"
-        if gia_fmt: tom_tat += f" — {gia_fmt}"
+        reply = f"📦 Ghi nhận nhập *{du_lieu.get('sp','')}*"
+        if gia_fmt: reply += f" — {gia_fmt}"
     else:
-        icon = "💰"
-        tc_loai = "Thu" if "thu" in loai.lower() else "Chi"
-        tom_tat = f"Ghi nhận {tc_loai}: {du_lieu.get('gc','')}"
-        if gia_fmt: tom_tat += f" — {gia_fmt}"
+        reply = f"💰 Ghi nhận {du_lieu.get('gc','')}"
+        if gia_fmt: reply += f" — {gia_fmt}"
 
-    reply = f"{icon} {tom_tat}"
-
-    # Cảnh báo nếu thiếu thông tin quan trọng
     if thieu:
-        reply += f"\n\n⚠️ Còn thiếu: {', '.join(thieu)}"
+        reply += f"\n⚠️ Còn thiếu: {', '.join(thieu)}"
 
-    await msg.reply_text(reply, parse_mode="Markdown")
+    await send_message(chat_id, reply, reply_to=msg_id)
 
-async def send_daily_report(bot: Bot):
+async def send_daily_report():
+    ngay = datetime.now().strftime("%d/%m/%Y")
     if not entries:
-        await bot.send_message(
-            chat_id=GROUP_ID,
-            text="📊 Hôm nay chưa có giao dịch nào được ghi nhận."
-        )
+        await send_message(GROUP_ID, f"📊 Ngày {ngay}: Chưa có giao dịch nào.")
         return
 
-    ngay = datetime.now().strftime("%d/%m/%Y")
     all_entries = "\n\n".join([
         f"[{e['time']} - {e['user']} - {e['loai']}]\n{e['raw']}"
         for e in entries
@@ -151,32 +132,32 @@ async def send_daily_report(bot: Bot):
         model="claude-sonnet-4-20250514",
         max_tokens=1000,
         system=REPORT_PROMPT,
-        messages=[{"role": "user", "content": f"Ngày {ngay}. Các giao dịch:\n\n{all_entries}"}]
+        messages=[{"role": "user", "content": f"Ngày {ngay}:\n\n{all_entries}"}]
     )
 
-    report = response.content[0].text
-    await bot.send_message(
-        chat_id=GROUP_ID,
-        text=f"📊 *BÁO CÁO CUỐI NGÀY*\n\n{report}",
-        parse_mode="Markdown"
-    )
+    await send_message(GROUP_ID, f"📊 *BÁO CÁO CUỐI NGÀY*\n\n{response.content[0].text}")
     entries.clear()
 
-async def scheduler(bot: Bot):
-    while True:
-        now = datetime.now()
-        if now.hour == 20 and now.minute == 0:
-            await send_daily_report(bot)
-            await asyncio.sleep(60)
-        await asyncio.sleep(30)
+async def polling():
+    offset = 0
+    async with httpx.AsyncClient(timeout=35) as http:
+        while True:
+            try:
+                r = await http.get(f"{BASE}/getUpdates", params={"offset": offset, "timeout": 30})
+                updates = r.json().get("result", [])
+                for u in updates:
+                    offset = u["update_id"] + 1
+                    msg = u.get("message")
+                    if msg and msg.get("text"):
+                        asyncio.create_task(process_message(msg))
+            except:
+                await asyncio.sleep(5)
 
 async def main():
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    asyncio.create_task(scheduler(app.bot))
-    await app.run_polling()
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(send_daily_report, "cron", hour=20, minute=0)
+    scheduler.start()
+    await polling()
 
 if __name__ == "__main__":
-import nest_asyncio
-nest_asyncio.apply()
-asyncio.get_event_loop().run_until_complete(main())
+    asyncio.run(main())
